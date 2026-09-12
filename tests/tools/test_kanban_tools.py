@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -1088,6 +1089,238 @@ def allow_private_urls(monkeypatch):
     url_safety._reset_allow_private_cache()
     yield
     url_safety._reset_allow_private_cache()
+
+
+# ---------------------------------------------------------------------------
+# kanban_attach_path — the on-disk attach path (no hand base64, no public URL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def host_workspace(monkeypatch, tmp_path):
+    """A host-backed workspace root for kanban_attach_path.
+
+    Pins the workspace anchor to a real directory and forces the host read path,
+    so the test exercises resolution/confinement/caps without booting a sandbox.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    from tools import file_tools, file_tools_paths
+
+    monkeypatch.setattr(file_tools_paths, "_uses_container_paths", lambda task_id="default": False)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id="default": object())
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda file_ops: True)
+    return workspace
+
+
+def _attachments(task_id):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        return kb.list_attachments(conn, task_id)
+    finally:
+        conn.close()
+
+
+def test_attach_path_stores_file_from_workspace(worker_env, host_workspace):
+    """The case the incident had no way to express: a file on disk, one call."""
+    from tools import kanban_tools as kt
+
+    src = host_workspace / "design.md"
+    body = ("# design\n" + "x" * 5000).encode()
+    src.write_bytes(body)
+
+    d = json.loads(kt._handle_attach_path({"path": str(src)}))
+    assert d.get("ok"), d
+    assert d["size"] == len(body)
+
+    (att,) = _attachments(worker_env)
+    assert att.filename == "design.md"
+    assert att.size == len(body)
+    assert att.content_type == "text/markdown"
+    assert pathlib.Path(att.stored_path).read_bytes() == body
+
+
+def test_attach_path_accepts_a_relative_path(worker_env, host_workspace):
+    from tools import kanban_tools as kt
+
+    (host_workspace / "sub").mkdir()
+    (host_workspace / "sub" / "report.txt").write_bytes(b"hello")
+
+    d = json.loads(kt._handle_attach_path({"path": "sub/report.txt"}))
+    assert d.get("ok"), d
+
+    (att,) = _attachments(worker_env)
+    assert att.filename == "report.txt"
+    assert pathlib.Path(att.stored_path).read_bytes() == b"hello"
+
+
+def test_attach_path_honours_filename_and_content_type(worker_env, host_workspace):
+    from tools import kanban_tools as kt
+
+    (host_workspace / "out.bin").write_bytes(b"\x00\x01\x02")
+    d = json.loads(kt._handle_attach_path(
+        {"path": "out.bin", "filename": "export.dat", "content_type": "application/x-thing"}))
+    assert d.get("ok"), d
+
+    (att,) = _attachments(worker_env)
+    assert att.filename == "export.dat"
+    assert att.content_type == "application/x-thing"
+
+
+def _assert_attach_path_rejected(worker_env, args, *, expect):
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_attach_path(args))
+    assert "error" in d, d
+    assert expect in d["error"], d["error"]
+    assert _attachments(worker_env) == []
+
+
+def test_attach_path_rejects_traversal(worker_env, host_workspace):
+    _assert_attach_path_rejected(
+        worker_env, {"path": "../../etc/passwd"}, expect="'..' component")
+
+
+def test_attach_path_rejects_absolute_path_outside_workspace(worker_env, host_workspace, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"secret")
+    _assert_attach_path_rejected(
+        worker_env, {"path": str(outside)}, expect="outside the task workspace")
+
+
+def test_attach_path_rejects_missing_file(worker_env, host_workspace):
+    _assert_attach_path_rejected(worker_env, {"path": "nope.md"}, expect="no file at")
+
+
+def test_attach_path_rejects_a_directory(worker_env, host_workspace):
+    (host_workspace / "adir").mkdir()
+    _assert_attach_path_rejected(
+        worker_env, {"path": "adir"}, expect="not a regular file")
+
+
+def test_attach_path_rejects_oversize_before_reading(worker_env, host_workspace, monkeypatch):
+    """The cap is a stat, not a read: nothing oversize is ever buffered."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    (host_workspace / "big.bin").write_bytes(b"z" * 4096)
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1024)
+
+    def _no_open(*a, **k):
+        raise AssertionError("oversize file was opened")
+
+    monkeypatch.setattr(kt, "open", _no_open, raising=False)
+    _assert_attach_path_rejected(
+        worker_env, {"path": "big.bin"}, expect="4096 bytes, over the 1024 byte attachment limit")
+
+
+def test_attach_path_twice_still_renames_rather_than_overwrites(worker_env, host_workspace):
+    """Pins ``_collision_free_path``: two attaches of one name are two files, by
+    design. This is what produced the duplicate ``design (1).md`` on team01 — it
+    must stay an explicit, tested contract, not drift into silent dedupe."""
+    from tools import kanban_tools as kt
+
+    src = host_workspace / "design.md"
+    src.write_bytes(b"first")
+    assert json.loads(kt._handle_attach_path({"path": "design.md"})).get("ok")
+    src.write_bytes(b"second")
+    assert json.loads(kt._handle_attach_path({"path": "design.md"})).get("ok")
+
+    first, second = _attachments(worker_env)
+    assert first.filename == "design.md"
+    assert second.filename == "design (1).md"
+    assert pathlib.Path(first.stored_path).read_bytes() == b"first"
+    assert pathlib.Path(second.stored_path).read_bytes() == b"second"
+
+
+class _FakeContainerFileOps:
+    """Minimal stand-in for a container-backed ShellFileOperations: answers the
+    stat probe and serves ``tail -c +N | head -c M | base64`` chunks."""
+
+    def __init__(self, data: bytes, *, chunk_calls: list):
+        self._data = data
+        self._chunk_calls = chunk_calls
+
+    @staticmethod
+    def _escape_shell_arg(arg):
+        return f"'{arg}'"
+
+    def _probe_regular_file(self, path):
+        return len(self._data), "ok"
+
+    def _exec(self, command, timeout=None):
+        import base64 as _b64
+        import re as _re
+        from tools.file_operations import ExecuteResult
+
+        m = _re.search(r"tail -c \+(\d+) .* head -c (\d+)", command)
+        assert m, command
+        start, want = int(m.group(1)) - 1, int(m.group(2))
+        self._chunk_calls.append((start, want))
+        return ExecuteResult(stdout=_b64.b64encode(self._data[start:start + want]).decode(), exit_code=0)
+
+    @staticmethod
+    def _decode_base64_sample(text):
+        from tools.file_operations import ShellFileOperations
+
+        return ShellFileOperations._decode_base64_sample(text)
+
+
+def test_attach_path_reassembles_container_chunks_byte_exactly(
+        worker_env, monkeypatch, tmp_path):
+    """A container backend has its own namespace, so bytes cross a text transport
+    as base64 chunks. Binary content must survive that round trip exactly."""
+    import os as _os
+
+    from tools import file_tools, file_tools_paths, kanban_tools as kt
+
+    workspace = tmp_path / "cworkspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    monkeypatch.setattr(file_tools_paths, "_uses_container_paths", lambda task_id="default": False)
+
+    data = _os.urandom(10_000)
+    calls: list = []
+    fake = _FakeContainerFileOps(data, chunk_calls=calls)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id="default": fake)
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda file_ops: False)
+    monkeypatch.setattr(kt, "_ATTACH_PATH_CHUNK_BYTES", 4096)
+
+    d = json.loads(kt._handle_attach_path({"path": "blob.bin"}))
+    assert d.get("ok"), d
+    assert d["size"] == len(data)
+    assert calls == [(0, 4096), (4096, 4096), (8192, 1808)]
+
+    (att,) = _attachments(worker_env)
+    assert pathlib.Path(att.stored_path).read_bytes() == data
+
+
+def test_attach_path_refuses_a_partial_container_read(worker_env, monkeypatch, tmp_path):
+    """A transport that stops mid-file must fail loudly. A silently truncated
+    attachment is how ``design.md.b64-part`` reached the team01 board."""
+    from tools import file_tools, file_tools_paths, kanban_tools as kt
+    from tools.file_operations import ExecuteResult
+
+    workspace = tmp_path / "pworkspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    monkeypatch.setattr(file_tools_paths, "_uses_container_paths", lambda task_id="default": False)
+
+    class _Stalls(_FakeContainerFileOps):
+        def _exec(self, command, timeout=None):
+            return ExecuteResult(stdout="", exit_code=0)
+
+    monkeypatch.setattr(
+        file_tools, "_get_file_ops",
+        lambda task_id="default": _Stalls(b"y" * 100, chunk_calls=[]))
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda file_ops: False)
+
+    _assert_attach_path_rejected(
+        worker_env, {"path": "blob.bin"}, expect="stopped after 0 of 100 bytes")
 
 
 def test_attach_url_rejects_non_http_scheme(worker_env):

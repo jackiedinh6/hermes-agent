@@ -4432,6 +4432,8 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        if getattr(cli, "_last_turn_setup_failed", False):
+            sys.exit(1)  # credentials or agent init failed, as in the quiet branch
     finally:
         _finalize_single_query(cli)
 

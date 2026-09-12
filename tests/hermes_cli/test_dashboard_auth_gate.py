@@ -385,6 +385,39 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         clear_providers()
 
 
+def test_start_server_trusts_every_declared_public_url(monkeypatch):
+    """A deployment reachable at several addresses trusts each one's hostname."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://192.168.1.101:9119")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URLS",
+        "https://100.81.223.78:9119,https://dashboard.example.test",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False,
+        )
+        assert web_server.app.state.auth_required is True
+        assert web_server.app.state.trusted_public_hosts == frozenset(
+            {"192.168.1.101", "100.81.223.78", "dashboard.example.test"}
+        )
+    finally:
+        clear_providers()
+
+
 def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypatch):
     """Trusting an external Host must never expose the loopback token mode."""
     from hermes_cli.dashboard_auth import clear_providers

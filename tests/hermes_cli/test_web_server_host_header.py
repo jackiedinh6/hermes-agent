@@ -61,6 +61,18 @@ class TestHostHeaderValidator:
         )
         assert not _is_accepted_host("evil.test", "127.0.0.1", trusted)
 
+    def test_several_trusted_public_hosts_are_each_accepted(self):
+        """One deployment reachable at several addresses (LAN IP + Tailscale IP)."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        trusted = frozenset({"192.168.1.101", "100.81.223.78"})
+        assert _is_accepted_host("192.168.1.101:9119", "127.0.0.1", trusted)
+        assert _is_accepted_host("100.81.223.78:9119", "127.0.0.1", trusted)
+        # Widening the set must not weaken it: an address outside it, and a
+        # suffix of one inside it, are still rejected.
+        assert not _is_accepted_host("10.0.0.5:9119", "127.0.0.1", trusted)
+        assert not _is_accepted_host("192.168.1.101.evil.test", "127.0.0.1", trusted)
+
     def test_malformed_host_authorities_fail_closed(self):
         """Ports, IPv6 brackets, and authority syntax must be unambiguous."""
         from hermes_cli.web_server import _is_accepted_host
@@ -211,6 +223,49 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+    def test_websocket_origin_outside_the_trusted_set_is_rejected(self, monkeypatch):
+        """Host and Origin are checked against the SAME set, independently. So with
+        several trusted addresses a page served from one may open a socket to
+        another — same deployment, same auth boundary — but an Origin outside the
+        set is still refused."""
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(
+            ws.app.state,
+            "trusted_public_hosts",
+            frozenset({"192.168.1.101", "100.81.223.78"}),
+            raising=False,
+        )
+        monkeypatch.setattr(ws.app.state, "auth_required", False, raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "100.81.223.78:9119",
+                "Origin": "https://100.81.223.78:9119",
+            },
+        ):
+            pass
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "100.81.223.78:9119",
+                    "Origin": "https://evil.test",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4403
 
     def test_trusted_public_websocket_rejects_cross_site_origin(self, monkeypatch):
         from fastapi.testclient import TestClient

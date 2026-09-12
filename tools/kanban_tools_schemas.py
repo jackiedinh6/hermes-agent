@@ -295,8 +295,10 @@ KANBAN_ATTACH_SCHEMA = _schema(
         "Use for genuine file artifacts the next worker or a human should "
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "the task's attachments dir, capped at 25 MB. Use this ONLY for "
+        "bytes you are holding in the conversation: when the file already "
+        "exists on disk use kanban_attach_path, and when you only have a "
+        "link use kanban_attach_url."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -319,7 +321,9 @@ KANBAN_ATTACH_URL_SCHEMA = _schema(
         "Attach a file to a task by URL — Hermes downloads it server-side "
         "and stores it as a real attachment (capped at 25 MB). Use when "
         "you have a link rather than the bytes. Only http/https URLs are "
-        "accepted."
+        "accepted, and private/loopback targets are SSRF-blocked — for a "
+        "file that already exists on disk use kanban_attach_path instead "
+        "of publishing it somewhere fetchable."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -334,6 +338,35 @@ KANBAN_ATTACH_URL_SCHEMA = _schema(
         )),
     },
     ["url"],
+)
+
+KANBAN_ATTACH_PATH_SCHEMA = _schema(
+    "kanban_attach_path",
+    (
+        "Attach a file that already exists on disk — the preferred way to "
+        "attach an artifact you just wrote. Hermes reads the bytes itself "
+        "and stores them as a real attachment (capped at 25 MB), so you "
+        "never base64-encode a file by hand or publish it to a URL just to "
+        "get it onto the card. The path is resolved exactly the way "
+        "read_file resolves one, so pass the same path you would read; it "
+        "must stay inside your task workspace."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "path": _prop("string", (
+                "Path to the file to attach — absolute, or relative to the "
+                "task workspace. Must resolve inside the workspace."
+        )),
+        "filename": _prop("string", (
+                "Optional name to store it under. Defaults to the path's "
+                "leaf component."
+        )),
+        "content_type": _prop("string", (
+                "Optional MIME type override. Defaults to the type guessed "
+                "from the filename."
+        )),
+    },
+    ["path"],
 )
 
 KANBAN_ATTACHMENTS_SCHEMA = _schema(

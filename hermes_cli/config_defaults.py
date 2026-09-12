@@ -984,6 +984,12 @@ DEFAULT_CONFIG = {
         # the OAuth path. Empty or malformed (no http(s):// + host, or quote/angle/whitespace chars)
         # = reconstruct from headers.
         "public_url": "",
+        # Additional public URLs for a deployment reachable at more than one address (a LAN IP and
+        # a Tailscale IP, say). Env HERMES_DASHBOARD_PUBLIC_URLS (comma-separated) is UNIONED with
+        # this list, not an override: the entries are additive grants. Only the hostnames are used,
+        # to widen the Host / WS Origin trust set — the OAuth redirect_uri always comes from
+        # public_url above. Malformed entries warn once and are dropped.
+        "public_urls": [],
     },
 
     "privacy": {

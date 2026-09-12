@@ -83,6 +83,9 @@ def prefix_from_request(request) -> str:
 
 # --- HERMES_DASHBOARD_PUBLIC_URL / dashboard.public_url --------------------
 
+# Additive Host/Origin grants, unlike the single canonical public_url below.
+_PUBLIC_URLS_ENV = "HERMES_DASHBOARD_PUBLIC_URLS"
+
 def _normalise_public_url(raw: Optional[str]) -> str:
     """Cleaned ``scheme://netloc[/path]`` (trailing slash stripped) or ``""`` when
     empty/malformed/injection-suspect (= fall back to request reconstruction)."""
@@ -128,3 +131,55 @@ def resolve_public_url() -> str:
     if not cfg_clean:
         _warn_if_malformed("dashboard.public_url in config.yaml", cfg_raw)
     return cfg_clean
+
+
+def _extra_public_url_values() -> list[str]:
+    """Raw ``dashboard.public_urls`` entries, then the env CSV.
+
+    Shape tolerance mirrors ``_dashboard_forwarded_allow_ips`` for
+    ``dashboard.trusted_proxies``: unset/empty means no entries, a bare string
+    means one, anything else warns once and is ignored.
+    """
+    raw = _load_dashboard_section().get("public_urls", [])
+    if raw in (None, ""):
+        values: list[str] = []
+    elif isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple)):
+        values = [item if isinstance(item, str) else str(item) for item in raw]
+    else:
+        _warn_once(
+            _warned_malformed_public_urls, ("dashboard.public_urls", repr(raw)), repr(raw),
+            "dashboard.public_urls must be a list of absolute URLs; ignoring %r", raw)
+        values = []
+    values.extend(os.environ.get(_PUBLIC_URLS_ENV, "").split(","))
+    return values
+
+
+def resolve_public_urls() -> tuple[str, ...]:
+    """Every operator-declared dashboard URL, canonical first, de-duplicated.
+
+    ``resolve_public_url`` stays the ONE canonical URL — the OAuth redirect_uri
+    is built from it, where a list would be meaningless. This adds
+    ``dashboard.public_urls`` / ``HERMES_DASHBOARD_PUBLIC_URLS`` for a
+    deployment reachable at more than one address (a LAN IP and a Tailscale IP,
+    say), whose hostnames the Host and WS Origin guards must trust.
+
+    Config and env are UNIONED here, rather than env-overrides-config as in
+    ``resolve_public_url``: these entries are additive grants, so letting the
+    env var shadow the config list would silently drop configured hosts.
+    """
+    urls: list[str] = []
+    primary = resolve_public_url()
+    if primary:
+        urls.append(primary)
+    for raw in _extra_public_url_values():
+        if not (raw or "").strip():
+            continue
+        cleaned = _normalise_public_url(raw)
+        if not cleaned:
+            _warn_if_malformed("a dashboard.public_urls entry", raw)
+            continue
+        if cleaned not in urls:
+            urls.append(cleaned)
+    return tuple(urls)

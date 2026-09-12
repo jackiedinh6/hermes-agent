@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path, PurePath
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -20,7 +21,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
-    KANBAN_ATTACH_SCHEMA,
+    KANBAN_ATTACH_PATH_SCHEMA, KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
@@ -798,6 +799,118 @@ def _handle_attach_url(args: dict, **kw) -> str:
         args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct)
 
 
+# Raw bytes crossing a container transport are base64-framed one chunk at a time:
+# a whole 25 MB file would be one ~34 MB stdout string, and a partial read must not
+# silently become a truncated attachment (that is exactly how ``design.md.b64-part``
+# reached a board).
+_ATTACH_PATH_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+def _reject_path(message: str):
+    raise _Reject(f"kanban_attach_path: {message}")
+
+
+def _resolve_attach_path(path_arg: str, session_task_id: str) -> str:
+    """Absolute path for *path_arg* in the backend's own namespace, confined to the
+    task workspace. Resolution goes through ``file_tools_paths`` so the path the model
+    sees in read_file/terminal is the path that works here (container namespaces
+    included); confinement mirrors ``_path_resolution_warning`` — an unknown workspace
+    root is not treated as permission to walk out of one."""
+    from tools import path_security
+    from tools.file_tools_paths import (
+        _authoritative_workspace_root, _expand_tilde, _normalize_without_host_deref,
+        _resolve_path_for_task, _uses_container_paths)
+    if path_security.has_traversal_component(_expand_tilde(path_arg)):
+        _reject_path(f"path {path_arg!r} contains a '..' component; pass a direct path")
+    resolved = _resolve_path_for_task(path_arg, session_task_id)
+    root = _authoritative_workspace_root(session_task_id)
+    if not root:
+        return str(resolved)
+    if _uses_container_paths(session_task_id):
+        # Container paths are meaningful only inside the sandbox: normalize the
+        # syntax, never deref a host symlink that happens to share the name.
+        if not _normalize_without_host_deref(resolved).is_relative_to(
+                _normalize_without_host_deref(_expand_tilde(root))):
+            _reject_path(f"path {path_arg!r} resolves outside the task workspace {root!r}")
+    elif path_security.validate_within_dir(Path(str(resolved)), Path(_expand_tilde(root))):
+        _reject_path(f"path {path_arg!r} resolves outside the task workspace {root!r}")
+    return str(resolved)
+
+
+def _read_attach_path_bytes(resolved: str, session_task_id: str, max_bytes: int) -> bytes:
+    """The file's bytes, read through the same backend ``read_file`` uses.
+
+    Host backends read directly; a container backend is asked for base64 chunks so
+    the bytes survive a transport that decodes stdout with ``errors="replace"``.
+    Size is checked before the read, never after, so an oversize file costs a stat.
+    """
+    from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops
+    file_ops = _get_file_ops(session_task_id)
+    if _file_ops_uses_host_paths(file_ops):
+        import stat as _stat
+        try:
+            st = os.stat(resolved)
+        except FileNotFoundError:
+            _reject_path(f"no file at {resolved}")
+        except OSError as e:
+            _reject_path(f"cannot stat {resolved}: {e}")
+        if not _stat.S_ISREG(st.st_mode):
+            _reject_path(f"{resolved} is not a regular file (directory, FIFO, socket or device)")
+        _check_attach_size(st.st_size, resolved, max_bytes)
+        with open(resolved, "rb") as fh:
+            return fh.read()
+
+    size, status = file_ops._probe_regular_file(resolved)
+    if status == "missing":
+        _reject_path(f"no file at {resolved}")
+    if status == "not_regular":
+        _reject_path(f"{resolved} is not a regular file (directory, FIFO, socket or device)")
+    if status != "ok":
+        _reject_path(f"could not stat {resolved} on the task's terminal backend ({status})")
+    _check_attach_size(size, resolved, max_bytes)
+    arg = file_ops._escape_shell_arg(resolved)
+    out = bytearray()
+    while len(out) < size:
+        want = min(_ATTACH_PATH_CHUNK_BYTES, size - len(out))
+        result = file_ops._exec(
+            f"tail -c +{len(out) + 1} {arg} | head -c {want} | base64", timeout=300)
+        if result.exit_code != 0:
+            _reject_path(f"could not read {resolved} from the task's terminal backend")
+        chunk = file_ops._decode_base64_sample(result.stdout)
+        if not chunk:
+            # A short or unframed chunk means the transport mangled the bytes; a
+            # partial attachment is worse than none.
+            _reject_path(
+                f"could not read {resolved} intact over the terminal transport "
+                f"(stopped after {len(out)} of {size} bytes)")
+        out += chunk
+    return bytes(out[:size])
+
+
+def _check_attach_size(size: int, resolved: str, max_bytes: int) -> None:
+    if size > max_bytes:
+        _reject_path(
+            f"{resolved} is {size} bytes, over the {max_bytes} byte attachment limit")
+
+
+@_kanban_handler("kanban_attach_path")
+def _handle_attach_path(args: dict, **kw) -> str:
+    """Attach a file that already exists on disk — no base64 by hand, no detour
+    through a public URL (both of which agents have resorted to without this)."""
+    import mimetypes
+    from hermes_cli import kanban_db as kb
+    tid = _worker_guard("kanban_attach_path", args)
+    path_arg = str(_require_text(args, "path")).strip()
+    # The kanban card id is not the terminal/file-tools key: that one arrives in the
+    # dispatch kwargs and is what ``read_file`` resolves and reads against.
+    session_task_id = kw.get("task_id") or "default"
+    resolved = _resolve_attach_path(path_arg, session_task_id)
+    data = _read_attach_path_bytes(resolved, session_task_id, kb.KANBAN_ATTACHMENT_MAX_BYTES)
+    filename = args.get("filename") or PurePath(resolved).name or "attachment"
+    content_type = args.get("content_type") or mimetypes.guess_type(str(filename))[0]
+    return _store_attachment(args.get("board"), tid, filename, data, content_type)
+
+
 @_kanban_handler("kanban_attachments")
 def _handle_attachments(args: dict, **kw) -> str:
     """List a task's attachments (read-only; no ownership restriction)."""
@@ -981,6 +1094,7 @@ _TOOLS = (
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
+    ("kanban_attach_path", KANBAN_ATTACH_PATH_SCHEMA, _handle_attach_path, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),

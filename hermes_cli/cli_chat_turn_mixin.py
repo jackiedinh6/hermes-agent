@@ -40,8 +40,12 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        # Single-query mode turns this into a non-zero exit, so a kanban worker that never reached the
+        # model is booked as a failure instead of a clean-exit protocol violation.
+        self._last_turn_setup_failed = False
 
         if not self._ensure_runtime_credentials():
+            self._last_turn_setup_failed = True
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -51,6 +55,7 @@ class CLIChatTurnMixin:
             _cprint(f"{_DIM}Initializing agent...{_RST}")
         if not self._init_agent(model_override=turn_route["model"], runtime_override=turn_route["runtime"],
                                 request_overrides=turn_route.get("request_overrides")):
+            self._last_turn_setup_failed = True
             return None
         agent = self.agent
         if agent is None:

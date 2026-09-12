@@ -359,6 +359,50 @@ class TestPublicUrlOverride:
             assert parsed.path == "/auth/callback"
 
 
+    def test_resolve_public_urls_unions_config_list_and_env(
+        self, monkeypatch, caplog
+    ):
+        """``public_urls`` widens the Host / WS Origin trust set without touching
+        the canonical ``public_url``. Config and env are UNIONED (the entries are
+        additive grants), the canonical URL comes first, duplicates collapse, and
+        a malformed entry is dropped with a warning rather than failing the boot."""
+        import logging
+
+        from hermes_cli.dashboard_auth import prefix as prefix_mod
+
+        prefix_mod._warned_malformed_public_urls.clear()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "dashboard": {
+                    "public_url": "https://192.168.1.101:9119",
+                    "public_urls": [
+                        "https://192.168.1.101:9119",  # duplicate of the canonical URL
+                        "https://100.81.223.78:9119",
+                        "192.168.1.7:9119",            # scheme-less — dropped
+                    ],
+                }
+            },
+        )
+        monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_PUBLIC_URLS", "https://dashboard.example.test"
+        )
+
+        with caplog.at_level(logging.WARNING, logger=prefix_mod.__name__):
+            urls = prefix_mod.resolve_public_urls()
+
+        assert urls == (
+            "https://192.168.1.101:9119",
+            "https://100.81.223.78:9119",
+            "https://dashboard.example.test",
+        )
+        # The canonical URL is untouched — the OAuth redirect_uri still builds from it.
+        assert prefix_mod.resolve_public_url() == "https://192.168.1.101:9119"
+        assert any(
+            "192.168.1.7:9119" in r.getMessage() for r in caplog.records
+        ), "a malformed public_urls entry must warn the operator"
+
     def test_scheme_less_public_url_env_warns_operator(
         self, patch_config, monkeypatch, caplog
     ):

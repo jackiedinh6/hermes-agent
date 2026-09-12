@@ -434,19 +434,22 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 def _dashboard_public_hosts() -> frozenset[str]:
-    """Return the exact hostname declared by ``dashboard.public_url``.
+    """Return the exact hostnames declared by ``dashboard.public_url`` and ``public_urls``.
 
     One source of truth for OAuth redirects, Host and WS Origin validation.
-    Malformed or unset values fail closed as an empty set.
+    Malformed or unset values fail closed, per entry, as an empty set.
     """
-    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+    from hermes_cli.dashboard_auth.prefix import resolve_public_urls
 
-    public_url = resolve_public_url()
-    try:
-        hostname = urllib.parse.urlparse(public_url).hostname if public_url else None
-    except ValueError:
-        hostname = None
-    return frozenset({hostname.lower()}) if hostname else frozenset()
+    hosts: set[str] = set()
+    for public_url in resolve_public_urls():
+        try:
+            hostname = urllib.parse.urlparse(public_url).hostname
+        except ValueError:
+            hostname = None
+        if hostname:
+            hosts.add(hostname.lower())
+    return frozenset(hosts)
 
 
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
